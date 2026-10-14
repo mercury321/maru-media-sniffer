@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "丸酱媒体嗅探助手",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Maru Media Sniffer organizes media requests into readable video entries.",
-  "permissions": ["storage", "downloads", "webRequest", "webNavigation", "declarativeNetRequestWithHostAccess", "offscreen"],
+  "permissions": ["storage", "downloads", "webRequest", "webNavigation", "declarativeNetRequestWithHostAccess", "offscreen", "scripting"],
   "host_permissions": ["<all_urls>"],
   "icons": {
     "16": "icons/maru-16.png",

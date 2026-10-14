@@ -28,6 +28,17 @@ async function setMaruActionIcon() {
 
 function emptyState(tabId) { return { tabId, page: { url: "", title: "", videoTitle: "", pageTitle: "", owner: "", cover: "", bvid: "", episode: "", host: "" }, groups: [], updatedAt: Date.now() }; }
 function getState(tabId) { if (!tabState.has(tabId)) tabState.set(tabId, emptyState(tabId)); return tabState.get(tabId); }
+async function restoreSessionState() {
+  const stored = await chrome.storage.session.get(null);
+  for (const [key, value] of Object.entries(stored)) {
+    const match = key.match(/^tab:(\d+)$/);
+    if (!match || !value || !Array.isArray(value.groups)) continue;
+    const tabId = Number(match[1]);
+    if (!tabState.has(tabId)) tabState.set(tabId, value);
+    updateBadge(tabId, tabState.get(tabId));
+  }
+}
+const sessionReady = restoreSessionState().catch(() => {});
 function downloadableCount(state) {
   if (state.groups.some(group => group.isBilibiliComplete)) return 1;
   return state.groups.filter(group => ["direct", "hls", "dash"].includes(group.type)).length;
@@ -307,6 +318,20 @@ function addMedia(tabId, url, type, details = {}) {
   persist(tabId);
 }
 function clearTab(tabId) { tabState.set(tabId, emptyState(tabId)); persist(tabId); }
+function canInjectIntoPage(url) { return /^https?:\/\//i.test(String(url || "")); }
+async function collectFromTab(tab) {
+  if (tab?.id === undefined) throw new Error("没有找到当前标签页");
+  try {
+    return await chrome.tabs.sendMessage(tab.id, { type: "collect-now" });
+  } catch (initialError) {
+    if (!canInjectIntoPage(tab.url)) throw new Error("当前页面受浏览器保护，无法注入嗅探脚本");
+    if (/^https?:\/\/(?:[^/]+\.)?youtube\.com\//i.test(tab.url || "")) {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["youtube-main.js"], world: "MAIN" });
+    }
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["shared.js", "content.js"] });
+    return chrome.tabs.sendMessage(tab.id, { type: "collect-now" });
+  }
+}
 function playUrls(value) { return [...new Set([value?.baseUrl, value?.base_url, ...(value?.backupUrl || []), ...(value?.backup_url || [])].filter(Boolean))]; }
 function playUrl(value) { return playUrls(value)[0] || ""; }
 function bvidFromUrl(url) { return String(url || "").match(/BV[0-9A-Za-z]{10}/)?.[0] || ""; }
@@ -456,8 +481,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const state = getState(tabId); state.page = { ...state.page, ...message.context }; state.groups.forEach(group => { group.title = state.page.title || group.title; group.owner = state.page.owner || group.owner; group.cover = state.page.cover || group.cover; group.sourceUrl = state.page.url || group.sourceUrl; group.host = state.page.host || group.host; group.bvid = state.page.isWeibo ? "" : state.page.bvid || group.bvid; group.episode = state.page.isWeibo ? "" : state.page.episode || group.episode; }); consolidateWeiboGroups(state); consolidateXGroups(state); state.updatedAt = Date.now(); persist(tabId); resolveBilibili(tabId).finally(() => sendResponse({ ok: true })); return true;
   }
   if (message.type === "media-hints" && tabId !== undefined) { message.items?.forEach(item => addMedia(tabId, item.url, item.type || classifyMediaUrl(item.url), { ...item, documentUrl: message.documentUrl, responseHeaders: [] })); sendResponse({ ok: true, count: message.items?.length || 0 }); return false; }
-  if (message.type === "get-current") { chrome.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => { if (tab?.id === undefined) return sendResponse(emptyState(-1)); const state = getState(tab.id); const tabUrl = tab.url || state.page.url; state.page = { ...state.page, url: tabUrl, pageTitle: state.page.pageTitle || tab.title || "", title: state.page.title || tab.title || "", host: state.page.host || sourceHost(tabUrl), bvid: state.page.bvid || bvidFromUrl(tabUrl), isBilibili: state.page.isBilibili || isBilibili(tabUrl) }; await resolveBilibili(tab.id); sendResponse(getState(tab.id)); }); return true; }
-  if (message.type === "capture-current") { chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => { if (tab?.id === undefined) return sendResponse({ ok: false, error: "没有找到当前标签页" }); chrome.tabs.sendMessage(tab.id, { type: "collect-now" }).then(result => sendResponse(result || { ok: true, found: 0 })).catch(() => sendResponse({ ok: false, error: "当前页面尚未注入嗅探脚本，请手动刷新一次页面" })); }); return true; }
+  if (message.type === "get-current") { chrome.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => { if (tab?.id === undefined) return sendResponse(emptyState(-1)); await sessionReady; let state = getState(tab.id); const tabUrl = tab.url || state.page.url; state.page = { ...state.page, url: tabUrl, pageTitle: state.page.pageTitle || tab.title || "", title: state.page.title || tab.title || "", host: state.page.host || sourceHost(tabUrl), bvid: state.page.bvid || bvidFromUrl(tabUrl), isBilibili: state.page.isBilibili || isBilibili(tabUrl) }; if (!downloadableCount(state)) { try { await collectFromTab(tab); await new Promise(resolve => setTimeout(resolve, 100)); state = getState(tab.id); } catch { /* Restricted browser pages cannot be scanned. */ } } await resolveBilibili(tab.id); sendResponse(getState(tab.id)); }).catch(error => sendResponse({ ...emptyState(-1), error: error.message || "读取当前页面失败" })); return true; }
+  if (message.type === "capture-current") { chrome.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => { const result = await collectFromTab(tab); sendResponse(result || { ok: true, found: 0 }); }).catch(error => sendResponse({ ok: false, error: error.message || "重新扫描当前页面失败" })); return true; }
   if (message.type === "clear-current") { if (message.tabId !== undefined) clearTab(message.tabId); sendResponse({ ok: true }); return false; }
   if (message.type === "download-status") { sendResponse({ failure: downloadFailures.get(message.id) || "" }); return false; }
   if (message.type === "download") {

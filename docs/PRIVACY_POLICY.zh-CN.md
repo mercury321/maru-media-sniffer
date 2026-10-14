@@ -25,6 +25,7 @@
 - `webNavigation`：在页面切换后清理旧记录。
 - `declarativeNetRequestWithHostAccess`：让用户主动下载的公开媒体请求携带来源页信息。
 - `offscreen`：本地处理临时媒体文件。
+- `scripting`：扩展更新或重新加载后，在用户主动扫描时将嗅探脚本重新注入当前网页。
 
 ## 用户选择
 
