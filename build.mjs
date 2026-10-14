@@ -1,0 +1,26 @@
+import { cp, mkdir, rm } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { generateIcons } from "./scripts/generate-icons.mjs";
+
+const root = dirname(fileURLToPath(import.meta.url));
+const dist = join(root, "dist");
+await rm(dist, { recursive: true, force: true });
+await mkdir(dist, { recursive: true });
+await generateIcons(join(dist, "icons"));
+await cp(join(root, "manifest.json"), join(dist, "manifest.json"));
+await cp(join(root, "LICENSE"), join(dist, "LICENSE"));
+await cp(join(root, "src", "shared", "shared.js"), join(dist, "shared.js"));
+await cp(join(root, "src", "content", "content.js"), join(dist, "content.js"));
+await cp(join(root, "src", "content", "youtube-main.js"), join(dist, "youtube-main.js"));
+await cp(join(root, "src", "background", "background.js"), join(dist, "background.js"));
+await cp(join(root, "src", "offscreen", "offscreen.html"), join(dist, "offscreen.html"));
+await cp(join(root, "src", "offscreen", "offscreen.js"), join(dist, "offscreen.js"));
+await cp(join(root, "src", "popup", "popup.html"), join(dist, "popup.html"));
+await cp(join(root, "src", "popup", "popup.css"), join(dist, "popup.css"));
+await cp(join(root, "src", "popup", "popup.js"), join(dist, "popup.js"));
+await cp(join(root, "src", "options", "options.html"), join(dist, "options.html"));
+await cp(join(root, "src", "options", "options.css"), join(dist, "options.css"));
+await cp(join(root, "src", "options", "options.js"), join(dist, "options.js"));
+await cp(join(root, "src", "privacy", "privacy.html"), join(dist, "privacy.html"));
+console.log(`Built Chrome extension to ${dist}`);

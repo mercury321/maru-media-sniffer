@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "丸酱媒体嗅探助手",
+  "version": "0.2.6",
+  "description": "Maru Media Sniffer organizes media requests into readable video entries.",
+  "permissions": ["storage", "downloads", "webRequest", "webNavigation", "declarativeNetRequestWithHostAccess", "offscreen"],
+  "host_permissions": ["<all_urls>"],
+  "icons": {
+    "16": "icons/maru-16.png",
+    "32": "icons/maru-32.png",
+    "48": "icons/maru-48.png",
+    "128": "icons/maru-128.png"
+  },
+  "action": {
+    "default_title": "丸酱媒体嗅探助手",
+    "default_icon": {
+      "16": "icons/maru-16.png",
+      "32": "icons/maru-32.png",
+      "48": "icons/maru-48.png"
+    },
+    "default_popup": "popup.html"
+  },
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["shared.js", "content.js"],
+    "run_at": "document_start"
+  }, {
+    "matches": ["*://*.youtube.com/*"],
+    "js": ["youtube-main.js"],
+    "world": "MAIN",
+    "run_at": "document_start"
+  }],
+  "options_page": "options.html"
+}

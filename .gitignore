@@ -1,0 +1,9 @@
+node_modules/
+dist/
+release/
+新建文件夹/
+
+*.log
+.DS_Store
+Thumbs.db
+

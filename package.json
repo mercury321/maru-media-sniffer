@@ -1,0 +1,14 @@
+{
+  "name": "maru-media-sniffer",
+  "private": true,
+  "version": "0.2.6",
+  "license": "GPL-3.0-only",
+  "scripts": {
+    "check": "node check.mjs",
+    "build": "node build.mjs",
+    "release": "npm run check && npm run build && node package-release.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}
