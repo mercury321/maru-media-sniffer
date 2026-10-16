@@ -8,7 +8,7 @@ function headerValue(headers, name) {
 
 function classifyMediaUrl(url, details = {}) {
   if (!url || !/^https?:/i.test(url)) return null;
-  const mime = headerValue(details.responseHeaders, "content-type").toLowerCase();
+  const mime = (headerValue(details.responseHeaders, "content-type") || details.mime || "").toLowerCase();
   try {
     const parsed = new URL(url);
     if (/(^|\.)googlevideo\.com$/i.test(parsed.hostname) && /\/videoplayback$/i.test(parsed.pathname)) return "segment";
@@ -16,8 +16,7 @@ function classifyMediaUrl(url, details = {}) {
   if (HLS_EXTENSIONS.test(url)) return "hls";
   if (MEDIA_EXTENSIONS.test(url)) return "direct";
   if (SEGMENT_EXTENSIONS.test(url)) {
-    const host = sourceHost(url);
-    if (host.endsWith("bilivideo.com")) return "dash";
+    if (isBilibiliMediaRequest(url, details)) return "dash";
     return "segment";
   }
   if (mime.includes("mpegurl") || mime.includes("m3u8")) return "hls";
@@ -65,8 +64,37 @@ function isBilibili(url) {
   try { return /(^|\.)bilibili\.com$|(^|\.)b23\.tv$/i.test(new URL(url).hostname); } catch { return false; }
 }
 
+function isBilibiliMediaRequest(url, details = {}) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname;
+    if (/(^|\.)(?:bilivideo\.com|bilivideo\.cn)$/i.test(host)) return true;
+    const pageUrl = details.documentUrl || details.initiator || details.originUrl || "";
+    return isBilibili(pageUrl) && /\.(?:m4s|cmfa|cmfv)(?:$|[?#])/i.test(url) && /\/upgcxcode\//i.test(parsed.pathname);
+  } catch { return false; }
+}
+
+function bilibiliStreamKindFromUrl(url) {
+  try {
+    const path = new URL(url).pathname;
+    return /-(?:30216|30232|30250|30251|30280|30300)\.m4s$/i.test(path) || /(?:audio|sound)[^/]*\.m4s$/i.test(path) ? "audio" : "video";
+  } catch { return "video"; }
+}
+
 function isWeibo(url) {
   try { return /(^|\.)weibo\.com$|(^|\.)weibo\.cn$/i.test(new URL(url).hostname); } catch { return false; }
+}
+
+function isWeiboDetail(url) {
+  try {
+    const parsed = new URL(url);
+    if (!isWeibo(url)) return false;
+    return /^\/\d+\/[0-9A-Za-z]+\/?$/.test(parsed.pathname)
+      || /^\/detail\/\d+\/?$/.test(parsed.pathname)
+      || /^\/status\/\d+\/?$/.test(parsed.pathname)
+      || /^\/tv\/show\/[^/]+\/?$/i.test(parsed.pathname)
+      || (/^\/show\/?$/i.test(parsed.pathname) && Boolean(parsed.searchParams.get("fid")));
+  } catch { return false; }
 }
 
 function isX(url) {

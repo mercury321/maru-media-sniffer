@@ -5,6 +5,8 @@ const MAX_GROUPS = 80;
 const protectedDownloads = new Set();
 const downloadFailures = new Map();
 const blobDownloads = new Map();
+const biliResolveTimers = new Map();
+const CONTENT_PROTOCOL_VERSION = 2;
 let creatingOffscreen = null;
 
 async function setMaruActionIcon() {
@@ -53,20 +55,18 @@ function updateBadge(tabId, state = tabState.get(tabId)) {
   chrome.action.setTitle({ tabId, title: count ? `丸酱媒体嗅探助手 · 发现 ${count} 个媒体资源` : "丸酱媒体嗅探助手" }).catch(() => {});
 }
 function persist(tabId) { const state = tabState.get(tabId); if (state) { chrome.storage.session.set({ [`tab:${tabId}`]: state }); updateBadge(tabId, state); } }
-function isWeiboDetail(url) {
-  try { const parsed = new URL(url); return isWeibo(url) && (/^\/\d+\/[0-9A-Za-z]+\/?$/.test(parsed.pathname) || /^\/detail\/\d+\/?$/.test(parsed.pathname)); } catch { return false; }
-}
 function weiboQuality(url) {
-  if (/(?:2160|4k)/i.test(url)) return { rank: 5, label: "4K" };
+  if (/(?:2160|4k)/i.test(url)) return { rank: 6, label: "4K" };
+  if (/(?:1440|2k)/i.test(url)) return { rank: 5, label: "2K" };
   if (/1080/i.test(url)) return { rank: 4, label: "1080P" };
   if (/720/i.test(url)) return { rank: 3, label: "720P" };
-  if (/480/i.test(url)) return { rank: 2, label: "480P" };
+  if (/(?:480|540)/i.test(url)) return { rank: 2, label: "480P" };
   if (/360/i.test(url)) return { rank: 1, label: "360P" };
-  if (/(?:hd|high)/i.test(url)) return { rank: 3, label: "高清" };
+  if (/(?:hd|high)/i.test(url)) return { rank: 2, label: "高清" };
   return { rank: 0, label: "" };
 }
 function weiboVariantScore(variant) {
-  let score = weiboQuality(variant.url).rank * 1_000_000_000;
+  let score = weiboQuality(`${variant.qualityLabel || ""} ${variant.url}`).rank * 1_000_000_000;
   score += Number(variant.byteSize || 0);
   if (variant.isPlayer) score += 1000;
   if (variant.currentTime > 0) score += 1000;
@@ -82,6 +82,7 @@ function mergeWeiboVariant(group, url, details, mime = "") {
   variant.currentTime = Math.max(variant.currentTime || 0, Number(details.currentTime || 0));
   variant.playerArea = Math.max(variant.playerArea || 0, Number(details.playerArea || 0));
   variant.mime = mime || variant.mime || "";
+  variant.qualityLabel = details.qualityLabel || variant.qualityLabel || "";
   const best = [...group.variants].sort((a, b) => weiboVariantScore(b) - weiboVariantScore(a))[0];
   group.url = best.url;
   group.byteSize = best.byteSize || 0;
@@ -90,7 +91,7 @@ function mergeWeiboVariant(group, url, details, mime = "") {
   group.currentTime = best.currentTime || 0;
   group.playerArea = best.playerArea || 0;
   group.mime = best.mime || group.mime || "";
-  group.qualityLabel = weiboQuality(best.url).label || (best.byteSize ? "最高可用" : "播放器画质");
+  group.qualityLabel = best.qualityLabel || weiboQuality(best.url).label || (best.byteSize ? "最高可用" : "播放器画质");
   group.count = group.variants.length;
   group.lastSeen = Date.now();
 }
@@ -239,7 +240,7 @@ function addMedia(tabId, url, type, details = {}) {
   const mime = headerValue(details.responseHeaders, "content-type") || details.mime || "";
   if (type === "dash") {
     const platform = details.platform === "youtube" ? "youtube" : "bilibili";
-    const streamKind = details.streamKind || (mime.toLowerCase().startsWith("audio/") || /(?:audio|sound)\.m4s/i.test(url) ? "audio" : "video");
+    const streamKind = details.streamKind || (mime.toLowerCase().startsWith("audio/") || bilibiliStreamKindFromUrl(url) === "audio" ? "audio" : "video");
     let dash = state.groups.find(group => group.type === "dash" && (group.platform || "bilibili") === platform);
     if (!dash) {
       const page = state.page;
@@ -317,20 +318,145 @@ function addMedia(tabId, url, type, details = {}) {
   state.updatedAt = Date.now();
   persist(tabId);
 }
-function clearTab(tabId) { tabState.set(tabId, emptyState(tabId)); persist(tabId); }
+function clearTab(tabId) {
+  const timer = biliResolveTimers.get(tabId);
+  if (timer) clearTimeout(timer);
+  biliResolveTimers.delete(tabId);
+  tabState.set(tabId, emptyState(tabId));
+  persist(tabId);
+}
 function canInjectIntoPage(url) { return /^https?:\/\//i.test(String(url || "")); }
+async function readPageMediaSnapshot() {
+  const meta = (name, property) => document.querySelector(`meta[name="${name}"], meta[property="${property}"]`)?.content || "";
+  const text = selectors => document.querySelector(selectors)?.textContent?.replace(/\s+/g, " ").trim() || "";
+  const absolute = value => { if (!value) return ""; try { return new URL(String(value), location.href).href; } catch { return ""; } };
+  const host = location.hostname.replace(/^www\./, "");
+  const initialState = window.__INITIAL_STATE__ || {};
+  const initialPlayInfo = window.__playinfo__ || window.__PLAYINFO__ || {};
+  const isBili = /(^|\.)bilibili\.com$|(^|\.)b23\.tv$/i.test(location.hostname) || Boolean((initialState.videoData?.bvid || initialState.bvid) && (initialPlayInfo.data || initialPlayInfo.result));
+  const isWeiboPage = /(^|\.)weibo\.com$|(^|\.)weibo\.cn$/i.test(location.hostname);
+  const videos = [...document.querySelectorAll("video, audio")];
+  const items = [];
+  const add = (url, details = {}) => {
+    const resolved = absolute(url);
+    if (/^https?:/i.test(resolved)) items.push({ url: resolved, ...details });
+  };
+  for (const media of videos) {
+    const details = { isPlayer: true, playerArea: Math.max(0, media.clientWidth * media.clientHeight), duration: Number.isFinite(media.duration) ? media.duration : 0, currentTime: Number.isFinite(media.currentTime) ? media.currentTime : 0 };
+    add(media.currentSrc || media.src || media.getAttribute("src"), details);
+    for (const source of media.querySelectorAll("source")) add(source.src || source.getAttribute("src"), details);
+  }
+  for (const entry of performance.getEntriesByType("resource")) add(entry.name);
+
+  let title = meta("", "og:title") || text("h1.video-title, h1[class*='video-title'], [class*='video-info'] h1, [class*='video-title']") || document.title;
+  let owner = meta("author", "og:article:author") || text("[class*='up-name'],[class*='author'],[rel='author']");
+  let cover = meta("", "og:image") || videos.find(media => media.poster)?.poster || "";
+  let episode = "";
+  let bvid = location.href.match(/BV[0-9A-Za-z]{10}/)?.[0] || "";
+
+  if (isBili) {
+    const initial = initialState;
+    const video = initial.videoData || initial.videoInfo || {};
+    title = video.title || initial.h1Title || title;
+    owner = video.owner?.name || initial.upData?.name || owner;
+    cover = video.pic || initial.pic || cover;
+    bvid = video.bvid || initial.bvid || bvid;
+    const part = Math.max(1, Number(new URL(location.href).searchParams.get("p") || 1));
+    episode = video.pages?.find(page => Number(page.page) === part)?.part || video.pages?.[part - 1]?.part || "";
+    const playInfo = initialPlayInfo;
+    const playData = playInfo.data || playInfo.result || playInfo;
+    const urls = value => [value?.baseUrl, value?.base_url, ...(value?.backupUrl || []), ...(value?.backup_url || [])].filter(Boolean);
+    for (const stream of playData?.dash?.video || []) for (const url of urls(stream)) add(url, { type: "dash", streamKind: "video", mime: stream.mimeType || "video/mp4", width: Number(stream.width || 0), height: Number(stream.height || 0), qualityLabel: stream.height ? `${stream.height}P` : "" });
+    for (const stream of playData?.dash?.audio || []) for (const url of urls(stream)) add(url, { type: "dash", streamKind: "audio", mime: stream.mimeType || "audio/mp4" });
+    for (const stream of playData?.durl || []) add(stream.url, { type: "direct", mime: "video/mp4", byteSize: Number(stream.size || 0), qualityLabel: playData.quality ? `${playData.quality}P` : "" });
+  }
+
+  if (isWeiboPage) {
+    const parsed = new URL(location.href);
+    const videoId = decodeURIComponent(parsed.pathname).match(/\/tv\/show\/([^/?#]+)/i)?.[1] || parsed.searchParams.get("fid") || "";
+    if (videoId) {
+      try {
+        const response = await fetch(`/tv/api/component?page=/tv/show/${encodeURIComponent(videoId)}`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ data: JSON.stringify({ Component_Play_Playinfo: { oid: videoId } }) })
+        });
+        if (response.ok) {
+          const payload = await response.json();
+          const info = payload?.data?.Component_Play_Playinfo;
+          if (info) {
+            title = info.title || info.text || title;
+            owner = info.author || info.nickname || owner;
+            cover = absolute(info.cover_image) || cover;
+            for (const [qualityLabel, url] of Object.entries(info.urls || {})) add(url, { type: "direct", qualityLabel, isPlayer: true });
+            add(info.stream_url, { type: "direct", qualityLabel: "播放器地址", isPlayer: true });
+          }
+        }
+      } catch { /* Network sniffing and DOM URLs remain available as fallback. */ }
+    }
+  }
+
+  const seen = new Set();
+  return {
+    context: { url: location.href, pageTitle: document.title, title, videoTitle: title, owner, cover, bvid, episode, host, isBilibili: isBili, isWeibo: isWeiboPage, playerCount: videos.filter(media => Math.max(0, media.clientWidth * media.clientHeight) >= 20000).length },
+    items: items.filter(item => item.url && !seen.has(item.url) && seen.add(item.url))
+  };
+}
+function ingestPageSnapshot(tabId, snapshot, documentUrl) {
+  if (!snapshot) return 0;
+  const state = getState(tabId);
+  const context = snapshot.context || {};
+  state.page = {
+    ...state.page,
+    ...context,
+    url: context.url || documentUrl || state.page.url,
+    title: cleanTitle(context.title || context.videoTitle || state.page.title, sourceHost(context.url || documentUrl)),
+    videoTitle: cleanTitle(context.videoTitle || context.title || state.page.videoTitle, sourceHost(context.url || documentUrl)),
+    owner: cleanTitle(context.owner || state.page.owner, ""),
+    episode: context.isWeibo ? "" : cleanTitle(context.episode || state.page.episode, "")
+  };
+  persist(tabId);
+  let found = 0;
+  for (const item of snapshot.items || []) {
+    const type = item.type || classifyMediaUrl(item.url, { ...item, documentUrl: state.page.url });
+    if (!type) continue;
+    addMedia(tabId, item.url, type, { ...item, documentUrl: state.page.url, responseHeaders: [] });
+    found += 1;
+  }
+  return found;
+}
+async function collectSnapshotFromTab(tab) {
+  if (!canInjectIntoPage(tab?.url)) return 0;
+  const results = await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: "MAIN", func: readPageMediaSnapshot });
+  return ingestPageSnapshot(tab.id, results?.[0]?.result, tab.url || "");
+}
 async function collectFromTab(tab) {
   if (tab?.id === undefined) throw new Error("没有找到当前标签页");
+  let response = null;
+  let initialError = null;
   try {
-    return await chrome.tabs.sendMessage(tab.id, { type: "collect-now" });
-  } catch (initialError) {
-    if (!canInjectIntoPage(tab.url)) throw new Error("当前页面受浏览器保护，无法注入嗅探脚本");
-    if (/^https?:\/\/(?:[^/]+\.)?youtube\.com\//i.test(tab.url || "")) {
-      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["youtube-main.js"], world: "MAIN" });
-    }
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["shared.js", "content.js"] });
-    return chrome.tabs.sendMessage(tab.id, { type: "collect-now" });
+    response = await chrome.tabs.sendMessage(tab.id, { type: "collect-now" });
+  } catch (error) {
+    initialError = error;
   }
+  if (!canInjectIntoPage(tab.url)) {
+    if (response) return response;
+    throw new Error("当前页面受浏览器保护，无法注入嗅探脚本");
+  }
+  let snapshotFound = 0;
+  try { snapshotFound = await collectSnapshotFromTab(tab); } catch { /* Some protected frames reject main-world snapshots. */ }
+  const staleContent = response && response.contentProtocol !== CONTENT_PROTOCOL_VERSION;
+  if (!response && !snapshotFound) {
+    if (/^https?:\/\/(?:[^/]+\.)?youtube\.com\//i.test(tab.url || "")) await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["youtube-main.js"], world: "MAIN" });
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["shared.js", "content.js"] });
+      response = await chrome.tabs.sendMessage(tab.id, { type: "collect-now" });
+    } catch (error) {
+      if (!snapshotFound) throw initialError || error;
+    }
+  }
+  return { ok: response?.ok !== false || snapshotFound > 0, found: Number(response?.found || 0) + snapshotFound, recovered: staleContent || Boolean(initialError), contentProtocol: response?.contentProtocol || 0 };
 }
 function playUrls(value) { return [...new Set([value?.baseUrl, value?.base_url, ...(value?.backupUrl || []), ...(value?.backup_url || [])].filter(Boolean))]; }
 function playUrl(value) { return playUrls(value)[0] || ""; }
@@ -430,6 +556,8 @@ function youtubeFileExtension(group, kind) {
 async function resolveBilibili(tabId) {
   const state = getState(tabId); const page = state.page;
   if (!page.isBilibili || !page.bvid || state.biliResolving === page.bvid || state.biliResolvedFor === page.bvid) return;
+  const observedDash = state.groups.find(group => group.type === "dash" && (group.platform || "bilibili") === "bilibili");
+  if (observedDash?.videoUrl && observedDash?.audioUrl) { state.biliResolvedFor = page.bvid; state.biliError = ""; persist(tabId); return; }
   state.biliResolving = page.bvid;
   try {
     const view = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(page.bvid)}`, { credentials: "include" }).then(response => response.json());
@@ -454,8 +582,20 @@ async function resolveBilibili(tabId) {
       } else throw new Error("当前视频没有可下载的公开媒体流");
     }
     state.biliResolvedFor = page.bvid;
-  } catch (error) { state.biliError = error.message || "B站播放地址解析失败"; }
+  } catch (error) {
+    const hasObservedMedia = state.groups.some(group => group.type === "dash" && (group.platform || "bilibili") === "bilibili" && (group.videoUrl || group.audioUrl));
+    state.biliError = hasObservedMedia ? "" : error.message || "B站播放地址解析失败";
+  }
   finally { state.biliResolving = ""; persist(tabId); }
+}
+function scheduleBilibiliResolve(tabId) {
+  const previous = biliResolveTimers.get(tabId);
+  if (previous) clearTimeout(previous);
+  const timer = setTimeout(() => {
+    biliResolveTimers.delete(tabId);
+    resolveBilibili(tabId).catch(() => {});
+  }, 1500);
+  biliResolveTimers.set(tabId, timer);
 }
 
 chrome.webRequest.onResponseStarted.addListener(details => {
@@ -464,7 +604,7 @@ chrome.webRequest.onResponseStarted.addListener(details => {
 }, { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "other"] }, ["responseHeaders"]);
 
 chrome.webNavigation.onCommitted.addListener(details => { if (details.frameId === 0) clearTab(details.tabId); });
-chrome.tabs.onRemoved.addListener(tabId => { tabState.delete(tabId); chrome.storage.session.remove(`tab:${tabId}`); });
+chrome.tabs.onRemoved.addListener(tabId => { const timer = biliResolveTimers.get(tabId); if (timer) clearTimeout(timer); biliResolveTimers.delete(tabId); tabState.delete(tabId); chrome.storage.session.remove(`tab:${tabId}`); });
 chrome.runtime.onInstalled.addListener(() => installBilibiliHeaderRule().catch(() => {}));
 chrome.runtime.onStartup.addListener(() => installBilibiliHeaderRule().catch(() => {}));
 installBilibiliHeaderRule().catch(() => {});
@@ -478,7 +618,7 @@ chrome.downloads.onChanged.addListener(delta => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const tabId = sender.tab?.id;
   if (message.type === "page-context" && tabId !== undefined) {
-    const state = getState(tabId); state.page = { ...state.page, ...message.context }; state.groups.forEach(group => { group.title = state.page.title || group.title; group.owner = state.page.owner || group.owner; group.cover = state.page.cover || group.cover; group.sourceUrl = state.page.url || group.sourceUrl; group.host = state.page.host || group.host; group.bvid = state.page.isWeibo ? "" : state.page.bvid || group.bvid; group.episode = state.page.isWeibo ? "" : state.page.episode || group.episode; }); consolidateWeiboGroups(state); consolidateXGroups(state); state.updatedAt = Date.now(); persist(tabId); resolveBilibili(tabId).finally(() => sendResponse({ ok: true })); return true;
+    const state = getState(tabId); state.page = { ...state.page, ...message.context }; state.groups.forEach(group => { group.title = state.page.title || group.title; group.owner = state.page.owner || group.owner; group.cover = state.page.cover || group.cover; group.sourceUrl = state.page.url || group.sourceUrl; group.host = state.page.host || group.host; group.bvid = state.page.isWeibo ? "" : state.page.bvid || group.bvid; group.episode = state.page.isWeibo ? "" : state.page.episode || group.episode; }); consolidateWeiboGroups(state); consolidateXGroups(state); state.updatedAt = Date.now(); persist(tabId); if (state.page.isBilibili) scheduleBilibiliResolve(tabId); sendResponse({ ok: true }); return false;
   }
   if (message.type === "media-hints" && tabId !== undefined) { message.items?.forEach(item => addMedia(tabId, item.url, item.type || classifyMediaUrl(item.url), { ...item, documentUrl: message.documentUrl, responseHeaders: [] })); sendResponse({ ok: true, count: message.items?.length || 0 }); return false; }
   if (message.type === "get-current") { chrome.tabs.query({ active: true, currentWindow: true }).then(async ([tab]) => { if (tab?.id === undefined) return sendResponse(emptyState(-1)); await sessionReady; let state = getState(tab.id); const tabUrl = tab.url || state.page.url; state.page = { ...state.page, url: tabUrl, pageTitle: state.page.pageTitle || tab.title || "", title: state.page.title || tab.title || "", host: state.page.host || sourceHost(tabUrl), bvid: state.page.bvid || bvidFromUrl(tabUrl), isBilibili: state.page.isBilibili || isBilibili(tabUrl) }; if (!downloadableCount(state)) { try { await collectFromTab(tab); await new Promise(resolve => setTimeout(resolve, 100)); state = getState(tab.id); } catch { /* Restricted browser pages cannot be scanned. */ } } await resolveBilibili(tab.id); sendResponse(getState(tab.id)); }).catch(error => sendResponse({ ...emptyState(-1), error: error.message || "读取当前页面失败" })); return true; }

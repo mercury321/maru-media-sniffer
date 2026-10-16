@@ -1,6 +1,7 @@
 node_modules/
 dist/
 release/
+output/
 新建文件夹/
 
 *.log
