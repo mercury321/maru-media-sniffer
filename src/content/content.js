@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_PROTOCOL_VERSION = 2;
+  const CONTENT_PROTOCOL_VERSION = 5;
   if (globalThis.__maruMediaSnifferContentProtocol === CONTENT_PROTOCOL_VERSION) return;
   globalThis.__maruMediaSnifferContentProtocol = CONTENT_PROTOCOL_VERSION;
   const getMeta = (name, property) => document.querySelector(`meta[name="${name}"], meta[property="${property}"]`)?.content || "";
@@ -21,7 +21,7 @@
     const owner = weibo.weiboOwner || getMeta("author", "og:article:author") || document.querySelector("[class*='up-name'],[class*='author'],[rel='author']")?.textContent?.trim() || "";
     const episode = isWeibo(location.href) ? "" : document.querySelector("[class*='page-info'] [class*='title'],[class*='video-page-card']")?.textContent?.trim() || "";
     const playerCount = [...document.querySelectorAll("video")].filter(video => Math.max(0, video.clientWidth * video.clientHeight) >= 20000).length;
-    return { url: location.href, pageTitle, title: cleanTitle(videoTitle, sourceHost(location.href)), videoTitle: cleanTitle(videoTitle, sourceHost(location.href)), owner: cleanTitle(owner, ""), cover, bvid: extractBvid(), episode: cleanTitle(episode, ""), host: sourceHost(location.href), isBilibili: isBilibili(location.href), isWeibo: isWeibo(location.href), playerCount };
+    return { url: location.href, pageTitle, title: cleanTitle(videoTitle, sourceHost(location.href)), videoTitle: cleanTitle(videoTitle, sourceHost(location.href)), owner: cleanTitle(owner, ""), cover, bvid: extractBvid(), episode: cleanTitle(episode, ""), host: sourceHost(location.href), isBilibili: isBilibili(location.href), isWeibo: isWeibo(location.href), isYouTube: isYouTube(location.href), youtubeVideoId: youtubeVideoIdFromUrl(location.href), playerCount };
   };
   const send = (overrides = {}) => chrome.runtime.sendMessage({ type: "page-context", context: { ...pageContext(), ...overrides } });
   const absoluteUrl = value => {
@@ -76,12 +76,15 @@
     if (!id) return 0;
     if (lastWeiboResolve.id === id && Date.now() - lastWeiboResolve.at < 5000) return 0;
     lastWeiboResolve = { id, at: Date.now() };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
     const response = await fetch(`/tv/api/component?page=/tv/show/${encodeURIComponent(id)}`, {
       method: "POST",
       credentials: "include",
+      signal: controller.signal,
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ data: JSON.stringify({ Component_Play_Playinfo: { oid: id } }) })
-    });
+    }).finally(() => clearTimeout(timer));
     if (!response.ok) throw new Error(`微博播放信息请求失败：HTTP ${response.status}`);
     const payload = await response.json();
     const info = payload?.data?.Component_Play_Playinfo;
@@ -101,16 +104,44 @@
     if (streamUrl) entries.push({ url: streamUrl, type: classifyMediaUrl(streamUrl, { documentUrl: location.href }) || "direct", qualityLabel: "播放器地址", isPlayer: true });
     return sendMediaHints(entries);
   };
-  const requestYouTubeFormats = () => document.dispatchEvent(new CustomEvent("maru-youtube-request"));
+  const youtubeRequests = new Map();
+  const requestYouTubeFormats = () => {
+    if (!isYouTube(location.href)) return Promise.resolve(0);
+    const requestId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return new Promise(resolve => {
+      const timer = setTimeout(() => { youtubeRequests.delete(requestId); resolve(0); }, 10000);
+      youtubeRequests.set(requestId, count => { clearTimeout(timer); youtubeRequests.delete(requestId); resolve(count); });
+      document.dispatchEvent(new CustomEvent("maru-youtube-request", { detail: JSON.stringify({ requestId }) }));
+    });
+  };
   const collectNow = async () => {
     send();
-    requestYouTubeFormats();
     const found = sendMediaHints([...domMediaUrls(), ...performance.getEntriesByType("resource"), ...weiboScriptUrls()]);
-    try { return found + await collectWeiboComponent(); } catch { return found; }
+    let platformFound = 0;
+    try { platformFound += await requestYouTubeFormats(); } catch { /* YouTube fallback remains optional. */ }
+    try { platformFound += await collectWeiboComponent(); } catch { /* Network observations can still succeed. */ }
+    return found + platformFound;
   };
-  document.addEventListener("maru-youtube-formats", event => {
+  document.addEventListener("maru-youtube-formats", async event => {
     try {
       const payload = JSON.parse(String(event.detail || "{}"));
+      const currentVideoId = youtubeVideoIdFromUrl(location.href);
+      if (currentVideoId && payload.videoId && currentVideoId !== payload.videoId) {
+        if (payload.requestId && youtubeRequests.has(payload.requestId)) youtubeRequests.get(payload.requestId)(0);
+        return;
+      }
+      const youtubeTitle = payload.title ? cleanTitle(payload.title, sourceHost(location.href)) : "";
+      send({
+        isYouTube: true,
+        youtubeVideoId: currentVideoId || payload.videoId || "",
+        youtubeStatus: payload.status || "UNKNOWN",
+        youtubeReason: payload.reason || "",
+        youtubeEncrypted: Number(payload.encryptedCount || 0),
+        youtubeSource: payload.source || "",
+        ...(youtubeTitle ? { title: youtubeTitle, videoTitle: youtubeTitle } : {}),
+        ...(payload.owner ? { owner: cleanTitle(payload.owner, "") } : {}),
+        ...(payload.cover ? { cover: payload.cover } : {})
+      });
       const items = (payload.formats || []).map(format => ({
         url: format.url,
         type: "dash",
@@ -124,8 +155,22 @@
         qualityLabel: format.qualityLabel || "",
         itag: Number(format.itag || 0)
       }));
-      sendMediaHints(items);
-    } catch { /* Ignore incomplete player data during navigation. */ }
+      await chrome.runtime.sendMessage({
+        type: "youtube-formats",
+        documentUrl: location.href,
+        videoId: currentVideoId || payload.videoId || "",
+        status: payload.status || "UNKNOWN",
+        reason: payload.reason || "",
+        source: payload.source || "",
+        items
+      });
+      if (payload.requestId && youtubeRequests.has(payload.requestId)) youtubeRequests.get(payload.requestId)(items.length);
+    } catch {
+      try {
+        const payload = JSON.parse(String(event.detail || "{}"));
+        if (payload.requestId && youtubeRequests.has(payload.requestId)) youtubeRequests.get(payload.requestId)(0);
+      } catch { /* Ignore incomplete player data during navigation. */ }
+    }
   });
   send();
   try { new PerformanceObserver(list => sendMediaHints(list.getEntries())).observe({ type: "resource", buffered: true }); } catch { /* Older pages still use explicit collection. */ }

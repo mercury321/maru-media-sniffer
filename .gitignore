@@ -2,6 +2,7 @@ node_modules/
 dist/
 release/
 output/
+.playwright-cli/
 新建文件夹/
 
 *.log

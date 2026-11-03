@@ -21,6 +21,7 @@ function classifyMediaUrl(url, details = {}) {
   }
   if (mime.includes("mpegurl") || mime.includes("m3u8")) return "hls";
   if (mime.startsWith("video/") || mime.startsWith("audio/")) return "direct";
+  if (mime && (mime.startsWith("text/") || mime.startsWith("image/") || mime.includes("json") || mime.includes("javascript") || mime.includes("font") || mime.includes("css"))) return null;
   if (details.type === "media") return "direct";
   return null;
 }
@@ -58,6 +59,19 @@ function safeFileName(title, episode = "") {
 
 function sourceHost(url) {
   try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return "未知网站"; }
+}
+
+function isYouTube(url) {
+  try { return /(^|\.)(?:youtube\.com|youtu\.be)$/i.test(new URL(url).hostname); } catch { return false; }
+}
+
+function youtubeVideoIdFromUrl(url) {
+  try {
+    const parsed = new URL(url);
+    if (/(^|\.)youtu\.be$/i.test(parsed.hostname)) return parsed.pathname.split("/").filter(Boolean)[0] || "";
+    if (!/(^|\.)youtube\.com$/i.test(parsed.hostname)) return "";
+    return parsed.searchParams.get("v") || parsed.pathname.match(/^\/(?:shorts|embed|live)\/([^/?#]+)/i)?.[1] || "";
+  } catch { return ""; }
 }
 
 function isBilibili(url) {
