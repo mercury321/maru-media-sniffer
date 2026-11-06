@@ -7,14 +7,22 @@ import { fileURLToPath } from "node:url";
 import { createServer as createNetServer } from "node:net";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const extensionPath = join(root, "dist");
+const extensionPath = process.env.MARU_EXTENSION_PATH || join(root, "dist");
 const chromePath = process.env.MARU_CHROME_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 const externalUrl = process.env.MARU_SMOKE_URL || "";
 const expectedType = process.env.MARU_EXPECTED_TYPE || "direct";
 const expectedPageStatus = process.env.MARU_EXPECTED_PAGE_STATUS || "";
 const fixture = process.env.MARU_FIXTURE || "";
+const expectedExtensionId = process.env.MARU_EXTENSION_ID || "";
+const verbose = process.env.MARU_SMOKE_VERBOSE === "1";
+const expectedVariantCount = Number(process.env.MARU_EXPECTED_VARIANT_COUNT || 0);
+const expectedQuality = process.env.MARU_EXPECTED_QUALITY || "";
+const expectedGroupCount = Number(process.env.MARU_EXPECTED_GROUP_COUNT || 0);
+const probeWeiboApi = process.env.MARU_WEIBO_API_PROBE === "1";
+const probePageMedia = process.env.MARU_PAGE_MEDIA_PROBE === "1";
 const profilePath = await mkdtemp(join(tmpdir(), "maru-smoke-"));
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+let detectedPopupTarget = null;
 
 async function terminateProcessTree(processId) {
   if (!processId) return;
@@ -39,13 +47,29 @@ async function json(url) {
 async function waitForTargets(port) {
   const deadline = Date.now() + 15_000;
   let lastTargets = [];
+  const attemptedExtensionIds = new Set();
   while (Date.now() < deadline) {
     try {
       const targets = await json(`http://127.0.0.1:${port}/json/list`);
-      lastTargets = targets.map(target => ({ type: target.type, url: target.url }));
+      lastTargets = targets.map(target => ({ type: target.type, url: target.url, title: target.title || "" }));
       const workers = targets.filter(target => target.type === "service_worker" && target.url.endsWith("/background.js"));
-      if (workers.length === 1) return workers[0];
+      if (expectedExtensionId) {
+        const exact = workers.find(worker => new URL(worker.url).hostname === expectedExtensionId);
+        if (exact) return exact;
+      }
       for (const worker of workers) {
+        const extensionId = new URL(worker.url).hostname;
+        if (!attemptedExtensionIds.has(extensionId)) {
+          attemptedExtensionIds.add(extensionId);
+          const popup = await createTarget(port, `chrome-extension://${extensionId}/popup.html`);
+          await delay(300);
+          const popupTargets = await json(`http://127.0.0.1:${port}/json/list`);
+          const popupTarget = popupTargets.find(target => target.id === popup.id || target.url === `chrome-extension://${extensionId}/popup.html`);
+          if (popupTarget && /嗅探助手/.test(popupTarget.title || "")) {
+            detectedPopupTarget = popupTarget;
+            return worker;
+          }
+        }
         try {
           const name = await evaluate(worker.webSocketDebuggerUrl, "chrome.runtime?.getManifest?.().name || ''");
           if (name === "丸酱媒体嗅探助手") return worker;
@@ -58,23 +82,54 @@ async function waitForTargets(port) {
 }
 
 async function evaluate(webSocketDebuggerUrl, expression) {
+  if (/msedge\.exe$/i.test(chromePath)) {
+    const targetId = webSocketDebuggerUrl.split("/").pop();
+    const version = await json(`http://127.0.0.1:${debugPort}/json/version`);
+    const socket = new WebSocket(version.webSocketDebuggerUrl);
+    await new Promise((resolve, reject) => {
+      socket.addEventListener("open", resolve, { once: true });
+      socket.addEventListener("error", reject, { once: true });
+    });
+    const request = (id, method, params = {}, sessionId = "") => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`Edge CDP ${method} timed out`)), 15000);
+      const listener = event => {
+        const message = JSON.parse(event.data);
+        if (message.id !== id) return;
+        socket.removeEventListener("message", listener);
+        clearTimeout(timer);
+        if (message.error) reject(new Error(message.error.message));
+        else resolve(message.result);
+      };
+      socket.addEventListener("message", listener);
+      socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+    });
+    const attached = await request(1, "Target.attachToTarget", { targetId, flatten: true });
+    await request(2, "Runtime.enable", {}, attached.sessionId);
+    const result = await request(3, "Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }, attached.sessionId);
+    socket.close();
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text || "CDP evaluation failed");
+    return result.result?.value;
+  }
   const socket = new WebSocket(webSocketDebuggerUrl);
   await new Promise((resolve, reject) => {
     socket.addEventListener("open", resolve, { once: true });
     socket.addEventListener("error", reject, { once: true });
   });
-  const id = 1;
-  const result = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("CDP evaluation timed out")), 15000);
-    socket.addEventListener("message", event => {
+  const request = (id, method, params = {}) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`CDP ${method} timed out`)), 15000);
+    const listener = event => {
       const message = JSON.parse(event.data);
       if (message.id !== id) return;
+      socket.removeEventListener("message", listener);
       clearTimeout(timer);
       if (message.error) reject(new Error(message.error.message));
       else resolve(message.result);
-    });
-    socket.send(JSON.stringify({ id, method: "Runtime.evaluate", params: { expression, awaitPromise: true, returnByValue: true } }));
+    };
+    socket.addEventListener("message", listener);
+    socket.send(JSON.stringify({ id, method, params }));
   });
+  await request(1, "Runtime.enable");
+  const result = await request(2, "Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
   socket.close();
   if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text || "CDP evaluation failed");
   return result.result?.value;
@@ -126,6 +181,10 @@ if (!targetUrl) {
         window.__INITIAL_STATE__ = { videoData: { bvid: "BV1fixture01", title: "B站恢复测试视频", pic: "", owner: { name: "丸酱测试" }, pages: [{ page: 1, part: "第一集" }] } };
         window.__playinfo__ = { data: { dash: { video: [{ baseUrl: "http://127.0.0.1:${web.address().port}/fixture-video.m4s", width: 1920, height: 1080, mimeType: "video/mp4" }], audio: [{ baseUrl: "http://127.0.0.1:${web.address().port}/fixture-audio.m4s", mimeType: "audio/mp4" }] } } };
       </script>`);
+    } else if (fixture === "inline-script") {
+      response.end(`<!doctype html><title>内联脚本媒体恢复测试</title><script type="application/json">{"media":"http://127.0.0.1:${web.address().port}/sample.mp4?token=inline"}</script>`);
+    } else if (fixture === "signed-dedupe") {
+      response.end(`<!doctype html><title>签名地址去重测试</title><video autoplay muted preload="auto" src="/sample.mp4?token=old&quality=1080"></video><script>fetch("/sample.mp4?quality=1080&token=new").catch(() => {})</script>`);
     } else {
       response.end("<!doctype html><title>丸酱烟雾测试</title><video autoplay muted preload='auto' controls src='/sample.mp4'></video><script>fetch('/sample.mp4?probe=1').catch(() => {})</script>");
     }
@@ -150,10 +209,10 @@ const chrome = spawn(chromePath, [
 
 try {
   const worker = await waitForTargets(debugPort);
-  let popupTarget = null;
+  let popupTarget = detectedPopupTarget;
   let mediaTarget = null;
   if (externalUrl || fixture) {
-    popupTarget = await createTarget(debugPort, `chrome-extension://${new URL(worker.url).hostname}/popup.html`);
+    popupTarget ||= await createTarget(debugPort, `chrome-extension://${new URL(worker.url).hostname}/popup.html`);
     const targets = await json(`http://127.0.0.1:${debugPort}/json/list`);
     mediaTarget = targets.find(target => target.type === "page" && target.url === targetUrl)
       || targets.find(target => target.type === "page" && target.url.startsWith(targetUrl))
@@ -185,7 +244,35 @@ try {
     console.log(`Smoke test passed: detected page status ${expectedPageStatus} with no false media groups`);
   } else {
     const matched = groups.find(group => group.type === expectedType);
+    if (!matched && probePageMedia && mediaTarget) {
+      const pageProbe = await evaluate(mediaTarget.webSocketDebuggerUrl, `JSON.stringify({
+        href: location.href,
+        videos: [...document.querySelectorAll("video, audio")].map(media => ({
+          currentSrc: media.currentSrc || "",
+          src: media.src || media.getAttribute("src") || "",
+          readyState: media.readyState,
+          networkState: media.networkState,
+          duration: Number.isFinite(media.duration) ? media.duration : 0
+        })),
+        resources: performance.getEntriesByType("resource").map(entry => entry.name).filter(url => /(?:twimg|video|m3u8|mp4|blob:)/i.test(url)).slice(-200),
+        inlineMedia: [...new Set([...document.scripts].flatMap(script => (script.textContent || "").split("http").slice(1).map(chunk => ("http" + chunk).split('"')[0].split("'")[0].split("<")[0].split(" ")[0].split("\\n")[0].split("\\r")[0].replaceAll("\\\\/", "/")).filter(url => /(?:video[.]twimg|[.]m3u8|[.]mp4)/i.test(url))))].slice(0, 100)
+      })`);
+      console.log(`Smoke page media probe: ${pageProbe}`);
+    }
     if (!matched) throw new Error(`No ${expectedType} media detected after ${mediaRequestCount} local request(s): ${JSON.stringify(state)}; scan=${scanResult}`);
+    if (expectedGroupCount && groups.length !== expectedGroupCount) throw new Error(`Expected ${expectedGroupCount} media group(s), found ${groups.length}: ${JSON.stringify(groups)}`);
+    if (verbose) console.log(`Smoke matched group: ${JSON.stringify(matched, null, 2)}`);
+    if (expectedVariantCount && matched.variants?.length !== expectedVariantCount) throw new Error(`Expected ${expectedVariantCount} media variant(s), found ${matched.variants?.length || 0}: ${JSON.stringify(matched)}`);
+    if (expectedQuality && matched.qualityLabel !== expectedQuality) throw new Error(`Expected quality ${expectedQuality}, found ${matched.qualityLabel || "unknown"}: ${JSON.stringify(matched)}`);
+    if (probeWeiboApi && mediaTarget && /(^|\.)weibo\.com\//i.test(new URL(targetUrl).hostname + new URL(targetUrl).pathname)) {
+      const apiProbe = await evaluate(mediaTarget.webSocketDebuggerUrl, `(async () => {
+        const id = decodeURIComponent(location.pathname).split("/").filter(Boolean).pop() || "";
+        const response = await fetch("/ajax/statuses/show?id=" + encodeURIComponent(id), { credentials: "include" });
+        const text = await response.text();
+        return JSON.stringify({ status: response.status, type: response.headers.get("content-type") || "", body: text.slice(0, 12000) });
+      })().catch(error => JSON.stringify({ error: error?.message || String(error) }))`);
+      console.log(`Smoke Weibo API probe: ${apiProbe}`);
+    }
     if (matched.isYouTube) {
       const probeUrl = matched.completeUrl || matched.videoUrl || matched.audioUrl;
       if (!probeUrl) throw new Error(`YouTube group has no downloadable candidate: ${JSON.stringify(matched)}`);
@@ -218,8 +305,11 @@ try {
 } finally {
   await terminateProcessTree(chrome.pid);
   if (web) await new Promise(resolve => web.close(resolve));
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
     try { await rm(profilePath, { recursive: true, force: true }); break; }
-    catch (error) { if (attempt === 4) throw error; await delay(200); }
+    catch (error) {
+      if (attempt === 9) { console.warn(`Smoke cleanup warning: ${error.message || error}`); break; }
+      await delay(300);
+    }
   }
 }

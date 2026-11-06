@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_PROTOCOL_VERSION = 5;
+  const CONTENT_PROTOCOL_VERSION = 9;
   if (globalThis.__maruMediaSnifferContentProtocol === CONTENT_PROTOCOL_VERSION) return;
   globalThis.__maruMediaSnifferContentProtocol = CONTENT_PROTOCOL_VERSION;
   const getMeta = (name, property) => document.querySelector(`meta[name="${name}"], meta[property="${property}"]`)?.content || "";
@@ -21,7 +21,7 @@
     const owner = weibo.weiboOwner || getMeta("author", "og:article:author") || document.querySelector("[class*='up-name'],[class*='author'],[rel='author']")?.textContent?.trim() || "";
     const episode = isWeibo(location.href) ? "" : document.querySelector("[class*='page-info'] [class*='title'],[class*='video-page-card']")?.textContent?.trim() || "";
     const playerCount = [...document.querySelectorAll("video")].filter(video => Math.max(0, video.clientWidth * video.clientHeight) >= 20000).length;
-    return { url: location.href, pageTitle, title: cleanTitle(videoTitle, sourceHost(location.href)), videoTitle: cleanTitle(videoTitle, sourceHost(location.href)), owner: cleanTitle(owner, ""), cover, bvid: extractBvid(), episode: cleanTitle(episode, ""), host: sourceHost(location.href), isBilibili: isBilibili(location.href), isWeibo: isWeibo(location.href), isYouTube: isYouTube(location.href), youtubeVideoId: youtubeVideoIdFromUrl(location.href), playerCount };
+    return { url: location.href, pageTitle, title: cleanTitle(videoTitle, sourceHost(location.href)), videoTitle: cleanTitle(videoTitle, sourceHost(location.href)), owner: cleanTitle(owner, ""), cover, bvid: extractBvid(), episode: cleanTitle(episode, ""), host: sourceHost(location.href), isTopFrame: window.top === window, isBilibili: isBilibili(location.href), isWeibo: isWeibo(location.href), isYouTube: isYouTube(location.href), youtubeVideoId: youtubeVideoIdFromUrl(location.href), playerCount };
   };
   const send = (overrides = {}) => chrome.runtime.sendMessage({ type: "page-context", context: { ...pageContext(), ...overrides } });
   const absoluteUrl = value => {
@@ -62,6 +62,23 @@
     });
     return urls;
   };
+  const genericInlineScriptUrls = () => {
+    if (isBilibili(location.href) || isWeibo(location.href) || isYouTube(location.href) || isX(location.href)) return [];
+    const urls = [];
+    let inspectedCharacters = 0;
+    const pattern = /https?:\\?\/\\?\/[^"'\\\s<>]+?\.(?:mp4|m3u8|webm|m4a|mp3)(?:\\?[^"'\\\s<>]*)?/gi;
+    for (const script of document.querySelectorAll("script:not([src])")) {
+      const text = script.textContent || "";
+      inspectedCharacters += text.length;
+      if (inspectedCharacters > 2_000_000) break;
+      for (const match of text.match(pattern) || []) {
+        const decoded = match.replace(/\\\//g, "/").replace(/\\u0026/gi, "&").replace(/&amp;/gi, "&");
+        if (/^https?:\/\//i.test(decoded)) urls.push(decoded);
+        if (urls.length >= 100) return urls;
+      }
+    }
+    return urls;
+  };
   const weiboVideoId = () => {
     if (!isWeibo(location.href)) return "";
     try {
@@ -70,7 +87,36 @@
       return pathId || parsed.searchParams.get("fid") || "";
     } catch { return ""; }
   };
+  const weiboStatusId = () => {
+    if (!isWeibo(location.href)) return "";
+    try {
+      const path = decodeURIComponent(new URL(location.href).pathname);
+      return path.match(/^\/\d+\/([0-9A-Za-z]+)\/?$/)?.[1]
+        || path.match(/^\/(?:detail|status)\/([0-9A-Za-z]+)\/?$/i)?.[1]
+        || "";
+    } catch { return ""; }
+  };
+  const secureWeiboUrl = value => {
+    const resolved = absoluteUrl(value);
+    return /^http:\/\/[^/]*weibocdn\.com\//i.test(resolved) ? resolved.replace(/^http:/i, "https:") : resolved;
+  };
+  const weiboMediaEntries = media => {
+    if (!media) return [];
+    const fields = [
+      ["mp4_2160p_mp4", "4K"], ["mp4_1440p_mp4", "2K"], ["mp4_1080p_mp4", "1080P"],
+      ["mp4_720p_mp4", "720P"], ["hevc_mp4_720p", "720P HEVC"],
+      ["stream_url_hd", "高清"], ["mp4_hd_url", "高清"], ["stream_url", "标清"], ["mp4_sd_url", "标清"]
+    ];
+    const entries = fields.map(([field, qualityLabel]) => ({ url: secureWeiboUrl(media[field]), type: "direct", qualityLabel, isPlayer: true }));
+    for (const item of media.playback_list || []) {
+      const info = item.play_info || item;
+      const playbackUrl = secureWeiboUrl(info.url || info.play_url);
+      if (/\.(?:mp4|m3u8)(?:$|[?#])/i.test(playbackUrl)) entries.push({ url: playbackUrl, type: "direct", qualityLabel: info.quality_desc || info.label || "播放器画质", isPlayer: true });
+    }
+    return entries.filter(item => item.url);
+  };
   let lastWeiboResolve = { id: "", at: 0 };
+  let lastWeiboStatusResolve = { id: "", at: 0 };
   const collectWeiboComponent = async () => {
     const id = weiboVideoId();
     if (!id) return 0;
@@ -104,6 +150,29 @@
     if (streamUrl) entries.push({ url: streamUrl, type: classifyMediaUrl(streamUrl, { documentUrl: location.href }) || "direct", qualityLabel: "播放器地址", isPlayer: true });
     return sendMediaHints(entries);
   };
+  const collectWeiboStatus = async () => {
+    const id = weiboStatusId();
+    if (!id) return 0;
+    if (lastWeiboStatusResolve.id === id && Date.now() - lastWeiboStatusResolve.at < 5000) return 0;
+    lastWeiboStatusResolve = { id, at: Date.now() };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+    const response = await fetch(`/ajax/statuses/show?id=${encodeURIComponent(id)}`, {
+      credentials: "include",
+      signal: controller.signal,
+      headers: { Accept: "application/json" }
+    }).finally(() => clearTimeout(timer));
+    if (!response.ok) throw new Error(`微博详情请求失败：HTTP ${response.status}`);
+    const payload = await response.json();
+    const media = payload?.page_info?.media_info;
+    if (!media) return 0;
+    const title = payload.text_raw || payload.page_info?.content1 || media.name || "";
+    const owner = payload.user?.screen_name || media.author_name || "";
+    const cover = secureWeiboUrl(media.big_pic_info?.pic_big?.url || media.page_pic || payload.page_info?.page_pic?.url || "");
+    if (title || owner || cover) send({ title: cleanTitle(title, sourceHost(location.href)), videoTitle: cleanTitle(title, sourceHost(location.href)), owner: cleanTitle(owner, ""), cover });
+    const playerArea = Math.max(...[...document.querySelectorAll("video")].map(video => Math.max(0, video.clientWidth * video.clientHeight)), 0);
+    return sendMediaHints(weiboMediaEntries(media).map(item => ({ ...item, playerArea })));
+  };
   const youtubeRequests = new Map();
   const requestYouTubeFormats = () => {
     if (!isYouTube(location.href)) return Promise.resolve(0);
@@ -116,12 +185,19 @@
   };
   const collectNow = async () => {
     send();
-    const found = sendMediaHints([...domMediaUrls(), ...performance.getEntriesByType("resource"), ...weiboScriptUrls()]);
+    const found = sendMediaHints([...domMediaUrls(), ...performance.getEntriesByType("resource"), ...weiboScriptUrls(), ...genericInlineScriptUrls()]);
     let platformFound = 0;
     try { platformFound += await requestYouTubeFormats(); } catch { /* YouTube fallback remains optional. */ }
     try { platformFound += await collectWeiboComponent(); } catch { /* Network observations can still succeed. */ }
+    try { platformFound += await collectWeiboStatus(); } catch { /* DOM and network observations remain available. */ }
     return found + platformFound;
   };
+  document.addEventListener("maru-deep-media", event => {
+    try {
+      const payload = JSON.parse(String(event.detail || "{}"));
+      sendMediaHints((payload.items || []).map(item => ({ ...item, deepSearch: true })));
+    } catch { /* Ignore malformed data from the page world. */ }
+  });
   document.addEventListener("maru-youtube-formats", async event => {
     try {
       const payload = JSON.parse(String(event.detail || "{}"));
@@ -184,5 +260,6 @@
   new MutationObserver(() => { if (last !== location.href) { last = location.href; setTimeout(collectNow, 500); } }).observe(document.documentElement, { subtree: true, childList: true });
   window.addEventListener("popstate", () => setTimeout(collectNow, 300));
   window.addEventListener("hashchange", () => setTimeout(collectNow, 300));
+  document.addEventListener("DOMContentLoaded", () => setTimeout(collectNow, 0), { once: true });
   setTimeout(collectNow, 700);
 })();

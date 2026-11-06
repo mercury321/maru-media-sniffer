@@ -12,6 +12,7 @@ await cp(join(root, "manifest.json"), join(dist, "manifest.json"));
 await cp(join(root, "LICENSE"), join(dist, "LICENSE"));
 await cp(join(root, "src", "shared", "shared.js"), join(dist, "shared.js"));
 await cp(join(root, "src", "content", "content.js"), join(dist, "content.js"));
+await cp(join(root, "src", "content", "deep-search-main.js"), join(dist, "deep-search-main.js"));
 await cp(join(root, "src", "content", "youtube-main.js"), join(dist, "youtube-main.js"));
 await cp(join(root, "src", "background", "background.js"), join(dist, "background.js"));
 await cp(join(root, "src", "offscreen", "offscreen.html"), join(dist, "offscreen.html"));

@@ -9,6 +9,8 @@ function headerValue(headers, name) {
 function classifyMediaUrl(url, details = {}) {
   if (!url || !/^https?:/i.test(url)) return null;
   const mime = (headerValue(details.responseHeaders, "content-type") || details.mime || "").toLowerCase();
+  const pageUrl = details.documentUrl || details.initiator || details.originUrl || "";
+  if (isWeibo(pageUrl) && /\/weibo_login\.mp4(?:$|[?#])/i.test(url)) return null;
   try {
     const parsed = new URL(url);
     if (/(^|\.)googlevideo\.com$/i.test(parsed.hostname) && /\/videoplayback$/i.test(parsed.pathname)) return "segment";
@@ -129,4 +131,17 @@ function normalizeUrl(url) {
     parsed.hash = "";
     return parsed.toString();
   } catch { return url; }
+}
+
+function stableMediaFingerprint(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    const volatile = /^(?:token|sig|signature|expires?|expiry|auth(?:_key)?|hdnea|hdnts|policy|key-pair-id|x-amz-.+|x-goog-.+|wssecret|wstime|deadline|upsig|uipk|trid)$/i;
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (volatile.test(key)) parsed.searchParams.delete(key);
+    }
+    parsed.searchParams.sort();
+    return parsed.toString();
+  } catch { return String(url || ""); }
 }
