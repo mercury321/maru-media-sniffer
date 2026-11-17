@@ -1,5 +1,5 @@
 (() => {
-  const CONTENT_PROTOCOL_VERSION = 9;
+  const CONTENT_PROTOCOL_VERSION = 11;
   if (globalThis.__maruMediaSnifferContentProtocol === CONTENT_PROTOCOL_VERSION) return;
   globalThis.__maruMediaSnifferContentProtocol = CONTENT_PROTOCOL_VERSION;
   const getMeta = (name, property) => document.querySelector(`meta[name="${name}"], meta[property="${property}"]`)?.content || "";
@@ -24,6 +24,39 @@
     return { url: location.href, pageTitle, title: cleanTitle(videoTitle, sourceHost(location.href)), videoTitle: cleanTitle(videoTitle, sourceHost(location.href)), owner: cleanTitle(owner, ""), cover, bvid: extractBvid(), episode: cleanTitle(episode, ""), host: sourceHost(location.href), isTopFrame: window.top === window, isBilibili: isBilibili(location.href), isWeibo: isWeibo(location.href), isYouTube: isYouTube(location.href), youtubeVideoId: youtubeVideoIdFromUrl(location.href), playerCount };
   };
   const send = (overrides = {}) => chrome.runtime.sendMessage({ type: "page-context", context: { ...pageContext(), ...overrides } });
+  let backgroundPort = null;
+  let heartbeatTimer = 0;
+  let reconnectTimer = 0;
+  const disconnectBackground = () => {
+    clearInterval(heartbeatTimer);
+    clearTimeout(reconnectTimer);
+    heartbeatTimer = 0;
+    reconnectTimer = 0;
+    if (backgroundPort) {
+      try { backgroundPort.disconnect(); } catch { /* Extension may have reloaded. */ }
+      backgroundPort = null;
+    }
+  };
+  const connectBackground = () => {
+    if (window.top !== window || document.hidden || backgroundPort) return;
+    clearTimeout(reconnectTimer);
+    try {
+      const port = chrome.runtime.connect({ name: "maru-visible-page" });
+      backgroundPort = port;
+      const heartbeat = () => { try { port.postMessage({ type: "heartbeat", contentProtocol: CONTENT_PROTOCOL_VERSION }); } catch { /* Reconnect below. */ } };
+      heartbeat();
+      heartbeatTimer = setInterval(heartbeat, 20000);
+      port.onDisconnect.addListener(() => {
+        if (backgroundPort !== port) return;
+        backgroundPort = null;
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = 0;
+        if (!document.hidden) reconnectTimer = setTimeout(connectBackground, 1000);
+      });
+    } catch {
+      reconnectTimer = setTimeout(connectBackground, 1500);
+    }
+  };
   const absoluteUrl = value => {
     if (!value) return "";
     try { return new URL(String(value), location.href).href; } catch { return ""; }
@@ -84,7 +117,15 @@
     try {
       const parsed = new URL(location.href);
       const pathId = decodeURIComponent(parsed.pathname).match(/\/tv\/show\/([^/?#]+)/i)?.[1] || "";
-      return pathId || parsed.searchParams.get("fid") || "";
+      if (pathId || parsed.searchParams.get("fid")) return pathId || parsed.searchParams.get("fid") || "";
+      for (const anchor of document.querySelectorAll('a[href*="video.weibo.com/show"], a[href*="/tv/show/"]')) {
+        const href = absoluteUrl(anchor.getAttribute("href") || anchor.href);
+        if (!href) continue;
+        const candidate = new URL(href);
+        const id = decodeURIComponent(candidate.pathname).match(/\/tv\/show\/([^/?#]+)/i)?.[1] || candidate.searchParams.get("fid") || "";
+        if (id) return id;
+      }
+      return "";
     } catch { return ""; }
   };
   const weiboStatusId = () => {
@@ -256,10 +297,23 @@
     collectNow().then(found => sendResponse({ ok: true, found, contentProtocol: CONTENT_PROTOCOL_VERSION })).catch(error => sendResponse({ ok: false, found: 0, contentProtocol: CONTENT_PROTOCOL_VERSION, error: error.message || "扫描失败" }));
     return true;
   });
+  let collectTimer = 0;
+  const scheduleCollect = (delay = 0) => {
+    clearTimeout(collectTimer);
+    collectTimer = setTimeout(() => collectNow().catch(() => {}), delay);
+  };
   let last = location.href;
-  new MutationObserver(() => { if (last !== location.href) { last = location.href; setTimeout(collectNow, 500); } }).observe(document.documentElement, { subtree: true, childList: true });
-  window.addEventListener("popstate", () => setTimeout(collectNow, 300));
-  window.addEventListener("hashchange", () => setTimeout(collectNow, 300));
-  document.addEventListener("DOMContentLoaded", () => setTimeout(collectNow, 0), { once: true });
-  setTimeout(collectNow, 700);
+  new MutationObserver(() => { if (last !== location.href) { last = location.href; scheduleCollect(500); } }).observe(document.documentElement, { subtree: true, childList: true });
+  window.addEventListener("popstate", () => scheduleCollect(300));
+  window.addEventListener("hashchange", () => scheduleCollect(300));
+  window.addEventListener("pageshow", () => scheduleCollect(0));
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) disconnectBackground();
+    else { connectBackground(); scheduleCollect(0); }
+  });
+  document.addEventListener("loadedmetadata", event => { if (event.target?.matches?.("video, audio")) scheduleCollect(0); }, true);
+  document.addEventListener("playing", event => { if (event.target?.matches?.("video, audio")) scheduleCollect(0); }, true);
+  document.addEventListener("DOMContentLoaded", () => scheduleCollect(0), { once: true });
+  connectBackground();
+  scheduleCollect(700);
 })();

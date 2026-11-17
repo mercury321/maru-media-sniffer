@@ -24,7 +24,7 @@ const checkNode = file => new Promise((resolve, reject) => {
 for (const file of files) await checkNode(file);
 const manifest = JSON.parse(await readFile(join(root, "manifest.json"), "utf8"));
 if (manifest.manifest_version !== 3 || manifest.background?.service_worker !== "background.js") throw new Error("Invalid Manifest V3 configuration");
-assert.equal(manifest.version, "0.3.6");
+assert.equal(manifest.version, "0.3.8");
 const xDeepSearch = manifest.content_scripts?.find(script => script.world === "MAIN" && script.js?.includes("deep-search-main.js"));
 if (!xDeepSearch || !xDeepSearch.all_frames || !xDeepSearch.matches?.some(pattern => pattern.includes("x.com"))) throw new Error("X main-world media observer is missing");
 const background = await readFile(join(root, "src/background/background.js"), "utf8");
@@ -34,8 +34,17 @@ if (!background.includes("replaceYouTubeFormats") || !background.includes("refre
 if (!background.includes("withTimeout") || !background.includes("fetchJsonWithTimeout")) throw new Error("Edge timeout recovery is missing");
 if (!background.includes("webRequest.onBeforeRequest") || !background.includes("webRequest.onResponseStarted")) throw new Error("Dual-phase media request observation is missing");
 if (!background.includes("pruneClosedTabState") || !background.includes("tabs.onReplaced")) throw new Error("Service-worker state recovery is missing");
+if (!background.includes('sendMessage(tab.id, { type: "collect-now" }, { frameId: 0 })')) throw new Error("Top-frame collection targeting is missing");
+if (background.includes("restoreSessionState().then(pruneClosedTabState)")) throw new Error("Session restore must not wait for stale-tab pruning");
+if (!background.includes("resolveWeiboFromBackground") || !background.includes("weiboRecoverySource") || !background.includes("webNavigation.onCompleted")) throw new Error("Independent Weibo background recovery is missing");
+if (!background.includes("runtime.onConnect") || !background.includes('port.name !== "maru-visible-page"')) throw new Error("Visible-page worker heartbeat is missing");
 const content = await readFile(join(root, "src/content/content.js"), "utf8");
-if (!content.includes("CONTENT_PROTOCOL_VERSION = 9") || !content.includes("isTopFrame: window.top === window")) throw new Error("Content script protocol version or frame identity is missing");
+if (!content.includes("CONTENT_PROTOCOL_VERSION = 11") || !content.includes("isTopFrame: window.top === window")) throw new Error("Content script protocol version or frame identity is missing");
+if (!content.includes('a[href*="video.weibo.com/show"]')) throw new Error("Weibo inline video id recovery is missing");
+if (!content.includes('runtime.connect({ name: "maru-visible-page" })') || !content.includes("setInterval(heartbeat, 20000)")) throw new Error("Content worker heartbeat is missing");
+for (const eventName of ["pageshow", "visibilitychange", "loadedmetadata", "playing"]) {
+  if (!content.includes(`addEventListener("${eventName}"`)) throw new Error(`Content wake recovery is missing: ${eventName}`);
+}
 if (!content.includes('type: "youtube-formats"') || !content.includes("youtubeRequests")) throw new Error("YouTube atomic refresh handshake is missing");
 if (!content.includes("collectWeiboStatus") || !background.includes("/ajax/statuses/show?id=")) throw new Error("Weibo detail API recovery is missing");
 const youtubeMain = await readFile(join(root, "src/content/youtube-main.js"), "utf8");

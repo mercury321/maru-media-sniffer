@@ -18,6 +18,8 @@ const verbose = process.env.MARU_SMOKE_VERBOSE === "1";
 const expectedVariantCount = Number(process.env.MARU_EXPECTED_VARIANT_COUNT || 0);
 const expectedQuality = process.env.MARU_EXPECTED_QUALITY || "";
 const expectedGroupCount = Number(process.env.MARU_EXPECTED_GROUP_COUNT || 0);
+const expectedRecoverySource = process.env.MARU_EXPECTED_RECOVERY_SOURCE || "";
+const expectWorkerHeartbeat = process.env.MARU_EXPECT_WORKER_HEARTBEAT === "1";
 const probeWeiboApi = process.env.MARU_WEIBO_API_PROBE === "1";
 const probePageMedia = process.env.MARU_PAGE_MEDIA_PROBE === "1";
 const profilePath = await mkdtemp(join(tmpdir(), "maru-smoke-"));
@@ -47,7 +49,7 @@ async function json(url) {
 async function waitForTargets(port) {
   const deadline = Date.now() + 15_000;
   let lastTargets = [];
-  const attemptedExtensionIds = new Set();
+  const openedExtensionIds = new Set();
   while (Date.now() < deadline) {
     try {
       const targets = await json(`http://127.0.0.1:${port}/json/list`);
@@ -59,13 +61,19 @@ async function waitForTargets(port) {
       }
       for (const worker of workers) {
         const extensionId = new URL(worker.url).hostname;
-        if (!attemptedExtensionIds.has(extensionId)) {
-          attemptedExtensionIds.add(extensionId);
-          const popup = await createTarget(port, `chrome-extension://${extensionId}/popup.html`);
-          await delay(300);
-          const popupTargets = await json(`http://127.0.0.1:${port}/json/list`);
-          const popupTarget = popupTargets.find(target => target.id === popup.id || target.url === `chrome-extension://${extensionId}/popup.html`);
-          if (popupTarget && /嗅探助手/.test(popupTarget.title || "")) {
+        const popupUrl = `chrome-extension://${extensionId}/popup.html`;
+        let popupTarget = targets.find(target => target.type === "page" && target.url === popupUrl);
+        if (!popupTarget && !openedExtensionIds.has(extensionId)) {
+          openedExtensionIds.add(extensionId);
+          await createTarget(port, popupUrl);
+          continue;
+        }
+        if (popupTarget) {
+          let popupTitle = popupTarget.title || "";
+          if (!/嗅探助手/.test(popupTitle)) {
+            try { popupTitle = await evaluate(popupTarget.webSocketDebuggerUrl, "document.title || ''"); } catch { /* Popup may still be loading. */ }
+          }
+          if (/嗅探助手/.test(popupTitle)) {
             detectedPopupTarget = popupTarget;
             return worker;
           }
@@ -133,6 +141,21 @@ async function evaluate(webSocketDebuggerUrl, expression) {
   socket.close();
   if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text || "CDP evaluation failed");
   return result.result?.value;
+}
+
+async function waitForExtensionRuntime(target) {
+  const deadline = Date.now() + 10_000;
+  let lastError = "";
+  let lastState = "";
+  while (Date.now() < deadline) {
+    try {
+      const state = await evaluate(target.webSocketDebuggerUrl, "JSON.stringify({ href: location.href, readyState: document.readyState, title: document.title, runtime: Boolean(globalThis.chrome?.runtime?.sendMessage), body: (document.body?.innerText || '').slice(0, 200) })");
+      lastState = state || "";
+      if (JSON.parse(state || "{}").runtime) return;
+    } catch (error) { lastError = error?.message || String(error); }
+    await delay(100);
+  }
+  throw new Error(`Extension popup runtime did not become ready${lastError ? `: ${lastError}` : ""}; state=${lastState}`);
 }
 
 async function sendCdp(webSocketDebuggerUrl, method, params = {}) {
@@ -213,6 +236,7 @@ try {
   let mediaTarget = null;
   if (externalUrl || fixture) {
     popupTarget ||= await createTarget(debugPort, `chrome-extension://${new URL(worker.url).hostname}/popup.html`);
+    await waitForExtensionRuntime(popupTarget);
     const targets = await json(`http://127.0.0.1:${debugPort}/json/list`);
     mediaTarget = targets.find(target => target.type === "page" && target.url === targetUrl)
       || targets.find(target => target.type === "page" && target.url.startsWith(targetUrl))
@@ -260,6 +284,8 @@ try {
       console.log(`Smoke page media probe: ${pageProbe}`);
     }
     if (!matched) throw new Error(`No ${expectedType} media detected after ${mediaRequestCount} local request(s): ${JSON.stringify(state)}; scan=${scanResult}`);
+    if (expectedRecoverySource && !Object.values(state || {}).some(value => value?.page?.weiboRecoverySource === expectedRecoverySource)) throw new Error(`Expected recovery source ${expectedRecoverySource}: ${JSON.stringify(state)}`);
+    if (expectWorkerHeartbeat && !Object.values(state || {}).some(value => Number(value?.page?.workerHeartbeatAt || 0) > 0)) throw new Error(`Visible-page worker heartbeat was not observed: ${JSON.stringify(state)}`);
     if (expectedGroupCount && groups.length !== expectedGroupCount) throw new Error(`Expected ${expectedGroupCount} media group(s), found ${groups.length}: ${JSON.stringify(groups)}`);
     if (verbose) console.log(`Smoke matched group: ${JSON.stringify(matched, null, 2)}`);
     if (expectedVariantCount && matched.variants?.length !== expectedVariantCount) throw new Error(`Expected ${expectedVariantCount} media variant(s), found ${matched.variants?.length || 0}: ${JSON.stringify(matched)}`);
